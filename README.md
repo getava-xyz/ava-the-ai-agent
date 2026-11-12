@@ -24,6 +24,46 @@ An agent can choose the wrong venue, misunderstand an amount, or report success 
 
 Ava combines agent-facing tools with bounded execution and chain-based verification. Its capability registry distinguishes implemented routes from routes that are enabled and reachable. Execution results are recorded as receipts that can be checked against public chain data.
 
+A mandate is the user's authority, and its lifecycle is explicit. Every execution reads the mandate's current state, so a pause or cancel applies to the next request. Paused, cancelled and completed mandates each refuse with their own code, and pause, resume and cancel leave the signed terms hash unchanged.
+
+```mermaid
+stateDiagram-v2
+  [*] --> active : created
+  active --> paused : pause
+  triggered --> paused : pause
+  paused --> active : resume
+  active --> triggered : exit condition matched
+  active --> cancelled : cancel
+  paused --> cancelled : cancel
+  triggered --> cancelled : cancel
+  cancelled --> [*]
+  note right of active
+    gates admit
+  end note
+  note right of triggered
+    exit condition matched, gates admit
+  end note
+  note right of paused
+    MANDATE_PAUSED on every execution
+  end note
+  note right of cancelled
+    MANDATE_CANCELLED on every execution
+  end note
+```
+
+Every execution is recorded as a receipt. Each receipt is hashed under RFC 8785 canonical JSON, linked to its predecessor and optionally signed with Ed25519. Chain heads are published to Base as calldata on a schedule, so rewriting a receipt at or below an anchored sequence needs a SHA-256 collision or a Base reorg.
+
+```mermaid
+flowchart LR
+  subgraph scope["One receipt chain per agent instance, h(R) = SHA-256 of the RFC 8785 canonical receipt"]
+    direction LR
+    r0["Receipt 0<br/>seq 0, prev null"] --> r1["Receipt 1<br/>seq 1, prev h(R0)"] --> r2["Receipt 2<br/>seq 2, prev h(R1)"] --> r3["Receipt 3<br/>seq 3, prev h(R2)"]
+  end
+  r2 -.->|"head: scope, seq 2, h(R2)"| anchor[("Anchor transaction on Base<br/>calldata carries the head")]
+  r3 -.->|"covered by the next anchor"| next["Next anchor"]
+  anchor --> check["Anyone with a receipt hash<br/>re-hashes it, walks the prev links<br/>and compares with the anchor"]
+```
+
 ## 5. How it works
 
 1. A user or agent creates an Ava session and provisions a wallet for the needed chain family.
@@ -32,6 +72,98 @@ Ava combines agent-facing tools with bounded execution and chain-based verificat
 4. For an enabled lending route, Ava prepares the transaction for review and applies the route's execution gates.
 5. The configured signer submits the transaction. Ava waits for chain evidence and records the settlement in a receipt.
 6. The receipt can be checked against the transaction and the chain data used to describe it.
+
+### Session and wallet onboarding
+
+An agent client reaches a wallet and a mandate in three MCP calls: `ava_session`, `ava_provision_wallet` and `ava_create_mandate`. Turnkey holds the key, and the agent never sees it.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor Dev as Developer
+  participant CLI as npx @getava-xyz/connect
+  participant Agent as Coding agent
+  participant Ava as Ava MCP API
+  participant TK as Turnkey
+
+  Dev->>CLI: run once
+  CLI->>Ava: ava_session
+  Ava-->>CLI: userId and bearer token
+  CLI->>Agent: write MCP config (Claude Code, Cursor, Codex)
+  CLI->>Ava: ava_provision_wallet(userId, family evm)
+  Ava->>TK: create the user's sub-organization wallet
+  TK-->>Ava: address
+  Ava-->>CLI: Base address to fund
+  Agent->>Ava: ava_create_mandate(portal, capital, constraints)
+  Ava-->>Agent: active mandate with its mandateId
+```
+
+### Request gates
+
+Every execution request passes seven gates in a fixed order. A failing gate returns its own typed refusal code and nothing is signed.
+
+```mermaid
+flowchart TD
+  req(["Agent request"]) --> g1{"1 Credential resolves<br/>and may spend?"}
+  g1 -->|"no"| e1["UNAUTHORIZED<br/>SPEND_CREDENTIAL_REQUIRED"]
+  g1 -->|"yes"| g2{"2 Mandate owned by the caller<br/>and kind allowed?"}
+  g2 -->|"no"| e2["MANDATE_NOT_FOUND<br/>MANDATE_KIND_NOT_ALLOWED"]
+  g2 -->|"yes"| g3{"3 Route built, reachable<br/>and operator-enabled?"}
+  g3 -->|"no"| e3["LEND_CAPABILITY_NOT_EXECUTABLE<br/>LEND_VENUE_MISMATCH"]
+  g3 -->|"yes"| g4{"4 Mandate active and in size,<br/>policy limits hold?"}
+  g4 -->|"no"| e4["MANDATE_PAUSED<br/>MANDATE_NOTIONAL_EXCEEDED<br/>POLICY_REJECTED"]
+  g4 -->|"yes"| g5{"5 Supplied preview hash equals<br/>the hash Ava recomputes?"}
+  g5 -->|"no"| e5["POLICY_HUMAN_CONFIRMATION_REQUIRED<br/>returns the preview and its hash"]
+  g5 -->|"yes"| g6{"6 Idempotency key claimed<br/>once for this action?"}
+  g6 -->|"no"| e6["EXECUTION_ALREADY_CLAIMED<br/>EXECUTION_CLAIM_CONTENT_MISMATCH<br/>EXECUTION_CLAIM_BUDGET_EXHAUSTED"]
+  g6 -->|"yes"| g7{"7 Daily and exposure<br/>budget reserved?"}
+  g7 -->|"no"| e7["POLICY_DAILY_NOTIONAL_EXCEEDED"]
+  g7 -->|"yes"| sign["Signer built, transaction signed and broadcast"]
+  sign --> rec["Chain confirms, verifier re-reads the effect, receipt appended"]
+
+  classDef refuse fill:#2a1414,stroke:#f87171,color:#fecaca
+  classDef ok fill:#132a1a,stroke:#4ade80,color:#bbf7d0
+  class e1,e2,e3,e4,e5,e6,e7 refuse
+  class sign,rec ok
+```
+
+### Lend execution
+
+Lending runs in two phases. The first call returns a preview and its hash, the human approves that hash, and the second call signs exactly what was previewed.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Agent
+  participant Ava as Ava API
+  actor Human
+  participant TK as Turnkey signer
+  participant Chain
+  participant V as Settlement verifier
+  participant R as Receipt chain
+
+  Agent->>Ava: ava_lend_execute(mandateId, amount)
+  Ava->>Ava: credential, mandate, capability and policy gates
+  Ava->>Ava: preview from chain state, h_P = SHA-256 of the RFC 8785 pre-image
+  Ava-->>Agent: POLICY_HUMAN_CONFIRMATION_REQUIRED with the preview and h_P
+  Agent->>Human: show the preview
+  Human-->>Agent: approve h_P
+  Agent->>Ava: ava_lend_execute(mandateId, amount, previewHash, idempotencyKey)
+  Ava->>Ava: recompute h_P from its own state and compare
+  alt hash matches and every gate holds
+    Ava->>Ava: claim the key, reserve budget and nonce
+    Ava->>TK: sign exactly the previewed transaction
+    TK-->>Ava: signed transaction
+    Ava->>Chain: broadcast
+    Chain-->>Ava: transaction receipt and logs
+    Ava->>V: compare the venue event and transfers with the authorization
+    V-->>Ava: settlement result
+    Ava->>R: append the hash-linked receipt
+    Ava-->>Agent: filled, tx hash, verify URL
+  else anything changed or a gate refuses
+    Ava-->>Agent: typed refusal, nothing signed
+  end
+```
 
 ## 6. Target users
 
@@ -85,19 +217,44 @@ Hackathon prizes from Flow, Wormhole, Hedera, Story, and Zircuit are listed in [
 
 ## 11. Architecture
 
-The model proposes. Deterministic code applies policy and route gates. A configured signer submits the authorized transaction. A verifier reads chain data and records the result.
+The model proposes. Deterministic code applies policy and route gates. A configured signer submits the authorized transaction. A verifier reads chain data and records the result. The signer is reached only after the credential, mandate, capability, policy, preview-hash, claim and reservation gates have passed.
 
 ```mermaid
-flowchart LR
-  A[User or agent] --> B[HTTP API or MCP]
-  B --> C[Intent and plan]
-  C --> D[Policy and mandate checks]
-  D --> E[Capability registry]
-  E --> F[Venue executor]
-  F --> G[Turnkey signer]
-  G --> H[Blockchain]
-  H --> I[Chain verifier]
-  I --> J[Receipt and ledger]
+flowchart TB
+  subgraph clients["Agent clients, no key held"]
+    agent["Claude Code, Cursor, Codex,<br/>any MCP client"]
+  end
+  human["Human<br/>grants the mandate once<br/>confirms the preview"]
+  api["MCP and HTTP API<br/>credential and spend check"]
+  subgraph ava["Ava: deterministic gates, in order"]
+    direction TB
+    parser["Intent parser<br/>request becomes a typed action"]
+    mandate["Mandate gate<br/>owner, kind, size"]
+    capability["Capability gate<br/>route built, reachable, enabled"]
+    policy["Policy gate<br/>order, daily, exposure limits"]
+    preview["Preview-hash confirmation<br/>previewed digest equals signed digest"]
+    claim["Single-flight claim<br/>one idempotency key, one signature"]
+    reservation["Reservation<br/>budget and nonce, durable"]
+    parser --> mandate --> capability --> policy --> preview --> claim --> reservation
+  end
+  refusal["Typed refusal<br/>nothing signed"]
+  signer["Turnkey signer<br/>key stays in Turnkey"]
+  chain[("Blockchain")]
+  verifier["Settlement verifier<br/>re-reads the transaction and venue event"]
+  receipts["Receipt chain<br/>hash-linked, RFC 8785"]
+  anchor[("Chain head anchored on Base")]
+
+  agent -->|"MCP or REST, bearer token"| api --> parser
+  human -.->|"signs the mandate"| mandate
+  human -.->|"approves the preview hash"| preview
+  ava -.->|"any gate fails"| refusal
+  reservation --> signer --> chain --> verifier --> receipts
+  receipts -.->|"periodic chain head"| anchor
+
+  classDef refuse fill:#2a1414,stroke:#f87171,color:#fecaca
+  classDef key fill:#132a1a,stroke:#4ade80,color:#bbf7d0
+  class refusal refuse
+  class signer,receipts key
 ```
 
 ## 12. Competitors and alternatives
@@ -127,7 +284,38 @@ Ava's distribution plan starts where agent builders already work:
 
 The current product has no active billing. The model under evaluation is a fee on a successful, verified settlement, with optional cost-based anchoring and retention for teams that need longer-lived records. The verification endpoint is designed as a free public trust surface. Ecosystem grants are treated as project funding, not recurring product revenue.
 
-## 15. Roadmap
+On swap routes Ava's disclosed platform fee is collected by the venue's own integrator-fee rails (LI.FI integrator fee, Jupiter platform fee), so no Ava contract touches user funds. The server alone sets the rate, and the fee sits inside both the preview hash and the intent hash, so the amount a human approves is the amount charged.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Agent
+  participant Ava as Ava API
+  actor Human
+  participant Venue as LI.FI or Jupiter
+  participant TK as Turnkey signer
+  participant Chain
+
+  Agent->>Ava: swap request
+  Ava->>Ava: fee terms from server config (AVA_FEE_BPS, default 25 bps, ceiling 100 bps)
+  Ava->>Venue: quote request with the integrator fee (LI.FI) or platformFeeBps (Jupiter)
+  Venue-->>Ava: quote carrying the fee
+  Ava->>Ava: the quoted fee must equal the configured rate
+  Ava-->>Agent: preview with the fee line, fee inside h_P
+  Agent->>Human: show the preview
+  Human-->>Agent: approve h_P
+  Agent->>Ava: execute with previewHash
+  Ava->>Ava: intent hash names the fee, reservation counts the fee
+  Ava->>TK: sign the swap
+  TK-->>Ava: signed transaction
+  Ava->>Chain: broadcast
+  Note over Chain: the venue's integrator-fee rail pays the fee to the registered account, no Ava contract in the funds path
+  Chain-->>Ava: transaction receipt and logs
+  Ava->>Ava: verifier accepts a delivery short by the disclosed fee only
+  Ava-->>Agent: outcome carries the fee amount and token
+```
+
+## 15. Priorities
 
 Priorities, without delivery-date promises:
 
